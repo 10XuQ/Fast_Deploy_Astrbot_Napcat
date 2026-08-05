@@ -31,7 +31,7 @@ LOG_DIR="$PWD/logs"
 # ---------- 作者与仓库(欢迎 Banner 显示, 部署前可自行修改) ----------
 AUTHOR="须知Ntk"                                          # 脚本作者名
 AUTHOR_GITHUB="https://github.com/10XuQ"               # 作者 GitHub 主页
-REPO_URL="https://github.com/10XuQ/astrbot-napcat-deploy"   # 本脚本仓库页
+REPO_URL="https://github.com/10XuQ/Fast_Deploy_Astrbot_Napcat"   # 本脚本仓库页
 
 # ---------- 国内网络加速配置 ----------
 # PyPI 清华镜像：uv/pip 安装 Python 依赖时使用
