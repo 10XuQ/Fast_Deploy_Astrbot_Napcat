@@ -2,8 +2,8 @@
 
 面向国内网络环境的 QQ 机器人一键搭建脚本。无需 Docker、纯 Shell 实现，在一台 Debian/Ubuntu 服务器上执行一行命令，即可自动完成 **AstrBot**（机器人框架，对接各大 AI 模型）与 **NapCat**（QQ 协议端）的安装、配置、启动与守护。
 
-- 作者：须知Ntk（[GitHub](https://github.com/10XuQ)）
-- 脚本由 AI 辅助编写
+- 作者：须知Ntk（[GitHub](https://github.com/10XuQ)）（[Bilibili](https://space.bilibili.com/392332353)）
+- 脚本 & README由 DeepSeek v4 flash 0731 编写
 
 ## 特性
 
@@ -153,10 +153,6 @@ cd ~/astrbot-data && astrbot run --reset-password
 
 ## 免责声明
 
-- 请使用小号/机器人专用 QQ 号，遵守 QQ 平台与 NapCat 使用条款，风险自负
-- NapCat 属于第三方协议端实现，与腾讯无关
+- 遵守 Astrbot & NapCat 使用条款
 - 脚本仅供学习交流使用
 
----
-
-如果这个项目对你有帮助，欢迎 Star / Fork / Issue。
