@@ -19,6 +19,7 @@
 - **守护体系**：崩溃自动拉起（30 秒检测）、systemd 开机自启、`bot` 状态面板、每周一 10:00 自动重启
 - **保姆级收尾**：自动提取 AstrBot 初始密码、读取 NapCat WebUI token、引导输入 QQ 号自动生成 onebot11 配置（含 16 位随机 token）
 - **配套清零脚本**：一条命令回滚所有部署痕迹，方便反复测试
+- **配套升级维护脚本**：`upgrade.sh` 独立负责装好之后的升级与维护 —— 升级 AstrBot / WebUI 面板 / NapCat、更新 QQ（自动卸载重装并把 NapCat 配置迁回来）、备份与恢复
 
 ## 环境要求
 
@@ -94,11 +95,46 @@ botrestart   # 重启守护服务
 
 部署时会询问是否启用守护体系与 4G swap（可选）。
 
+## 升级与维护
+
+`deploy.sh` 只管「第一次装好」，装好之后的升级与维护交给配套的 `upgrade.sh`。
+
+```bash
+bash upgrade.sh                # 交互菜单(推荐)
+bash upgrade.sh --status       # 只查看当前安装状态与版本
+bash upgrade.sh --astrbot      # 升级 AstrBot 本体
+bash upgrade.sh --webui        # 只更新 WebUI 管理面板
+bash upgrade.sh --protocol     # 升级 NapCat
+bash upgrade.sh --qq           # 更新 QQ
+bash upgrade.sh --backup       # 备份(AstrBot 数据 + NapCat 配置)
+bash upgrade.sh --restore      # 从备份恢复
+bash upgrade.sh --all          # 依次升级 AstrBot + WebUI + NapCat
+bash upgrade.sh --yes          # 免交互确认(配合上面任意动作使用)
+bash upgrade.sh --help
+```
+
+> `upgrade.sh` 会把同目录的 `deploy.sh` 当函数库加载，所以两个文件必须放在同一目录、且版本配套，否则会提示「deploy.sh 版本过旧」并退出。
+
+### 更新 QQ
+
+**NapCat 注入模式（官方脚本 / 系统布局）**：NapCat 是装在 QQ 目录内部的 —— 安装时先把 QQ 的 `.deb` 解包，再把 NapCat 的文件拷进 `resources/app/app_launcher/napcat/`，最后改写 QQ 的 `package.json` 把启动入口劫持到 `loadNapCat.js`。所以**换 QQ 版本必然把 NapCat 一起冲掉**。`upgrade.sh --qq` 会自动处理这个连锁反应：
+
+1. 卸载前先把 NapCat 配置（`onebot11_<QQ号>.json`、`webui.json` 等）备份出来
+2. 卸载旧 QQ，装新版本
+3. 把配置迁移回新装好的 NapCat，并重新完成注入
+
+过程中会询问**要不要顺便把 NapCat 也升到最新版**：选「否」就只换 QQ 本体，NapCat 保持原版本不动。
+
+**便携 AppImage 模式**：QQ 与 NapCat 都打包在 `NapCat.AppImage` 里，机器上没有独立安装的 QQ，所以「更新 QQ」实际就是换一个更新的 AppImage，脚本会直接走 NapCat 升级流程。
+
+> QQ 安装包的下载地址不是写死的，而是实时查询官方下载配置 `pcConfig.json` 得到的 —— 官方一换构建号，写死的链接就会 404。
+
 ## 文件说明
 
 | 文件 | 作用 |
 | --- | --- |
-| `deploy.sh` | 主部署脚本 |
+| `deploy.sh` | 主部署脚本（首次安装） |
+| `upgrade.sh` | 升级维护脚本（升级 / 更新 QQ / 备份恢复），需与 `deploy.sh` 同目录 |
 | `clean_all.sh` | 清零脚本，回滚所有部署痕迹 |
 
 部署后在服务器上生成的关键文件：
@@ -146,6 +182,28 @@ cd ~/astrbot-data && astrbot run --reset-password
 **Q5：显示"检测到已部署，是否跳过"？**
 
 这是防重复部署机制。选择跳过（默认）不会动现有环境；选择 n 会重新安装。
+
+**Q6：升级后 AstrBot 起不来 / 看不到日志？**
+
+AstrBot 的输出会落到**两个不同的文件**里，取决于它是被谁启动的：
+
+| 谁启动的 | 日志写到 |
+| --- | --- |
+| `deploy.sh` / `upgrade.sh` | `~/astrbot-data/astrbot.log` |
+| 守护服务 `astrbot-guardian` | `/var/log/astrbot/astrbot.log` |
+
+升级时守护服务会在几十秒内把 AstrBot 重新拉起，用的是它自己的那条路径。所以如果只盯着 `~/astrbot-data/astrbot.log`，会发现它停在升级前的那一刻，看起来就像「日志没了」——其实在 `/var/log/astrbot/astrbot.log` 里。
+
+另外，被强杀的 screen 会话会以 `(Dead)` 空壳状态残留，而 `screen -ls` 仍然会把它列出来。清理并按前台方式实跑一次，真正的报错会直接打印出来：
+
+```bash
+systemctl stop astrbot-guardian     # 先让守护停手，避免它一边重启一边抢日志
+screen -wipe                        # 清掉 (Dead) 空壳会话
+screen -S astrbot -X quit
+cd ~/astrbot-data && astrbot run    # 前台实跑，报错直接可见
+```
+
+如果 `astrbot` 命令本身都不见了，用 `uv tool list` 确认，再用 `uv tool install astrbot --python 3.12 --force` 重装。
 
 ## 开源许可
 

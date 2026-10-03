@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================
 # AstrBot + NapCat 一键搭建脚本 (Ubuntu 20+ / Debian 11+)
-# 全部使用 Shell 方式安装，无需 Docker，针对国内网络优化
+# 协议端使用 NapCat，全部使用 Shell 方式安装，无需 Docker
 #
 # 用法:
 #   bash deploy.sh                     # 交互引导模式(推荐)
@@ -9,6 +9,8 @@
 #   bash deploy.sh --napcat-installer  # NapCat 改用官方一键脚本(安装到 /opt)
 #   bash deploy.sh --astrbot-only      # 仅安装 AstrBot
 #   bash deploy.sh --napcat-only       # 仅安装 NapCat
+#
+# 维护/升级请使用配套的 upgrade.sh
 # ============================================================
 
 set -e
@@ -18,6 +20,12 @@ set -e
 export DEBIAN_FRONTEND=noninteractive
 export NEEDRESTART_MODE=a
 
+# ---------- 提权前缀 ----------
+# 需要 root 权限的命令统一写成 $SUDO xxx：root 下 $SUDO 为空，普通用户下是 sudo。
+# (upgrade.sh 会 source 本文件，这里做成全局变量两个脚本共用)
+SUDO=""
+[ "$EUID" -ne 0 ] && SUDO="sudo"
+
 # ---------- 配置项 ----------
 INSTALL_ASTRBOT=1
 INSTALL_NAPCAT=1
@@ -25,6 +33,9 @@ USE_SOURCE=0
 MENU_MODE=1
 # NapCat 安装方式: 1=新式非入侵式启动器(默认,不污染系统) 0=官方一键脚本(安装到 /opt)
 NAPCAT_LAUNCHER=1
+# NapCat AppImage 文件名(放在部署目录下)
+NAPCAT_APPIMAGE_NAME="NapCat.AppImage"
+
 # 详细输出日志目录（前台只显示一行进度条，完整日志见此处）
 LOG_DIR="$PWD/logs"
 
@@ -42,12 +53,188 @@ PYPI_MIRROR="https://pypi.tuna.tsinghua.edu.cn/simple"
 GH_PROXY="https://gh-proxy.com/"
 ASTRBOT_REPO="https://github.com/AstrBotDevs/AstrBot.git"
 
+# ---------- QQ (LinuxQQ) 版本配置 ----------
+# 腾讯官方下载页 (https://im.qq.com/linuxqq/download.html) 是 JS 渲染的，没法直接
+# curl 出直链；但它自己会加载一份机器可读的 pcConfig.json，里面有全部架构的 deb 直链。
+# 所以优先走 qq_official_deb() 查接口，下面这些常量只在接口不可达时兜底。
+#
+# 【重要】不要以为钉一个版本号就万事大吉：腾讯的下载路径里带内部构建号
+# (qqfile/QQNTV2/9.9.36/release/9ee04bef/...)，构建号一变，老直链立刻 404。
+# 老脚本里那套 qqfile/QQNT/9.9.32/beta/727ce4e5/linuxqq_3.2.30-50828_*.deb 已经全 404。
+#
+# 版本号写法 = deb 文件名里的版本段(如 3.2.34_260924)，这样 qq_deb_url 能直接拼出
+# 新版命名 QQ_<ver>_<arch>_01.deb；和 QQ 自己 package.json 里的 3.2.34-260924 比较
+# 请用 qq_same_version()，它会自动归一化下划线/连字符。
+QQ_PIN_VERSION="3.2.34_260924"                  # 兜底版本(实测官方当前稳定版)
+QQ_PIN_BUILD_TAG="9.9.36/release/9ee04bef"      # 官方下载路径中的内部构建号
+QQ_DL_BASE="https://qqdl.gtimg.cn/qqfile/QQNTV2/${QQ_PIN_BUILD_TAG}"
+
+# 第三方镜像(Rodert/qq-versions 项目会同步腾讯各版本的安装包)，官方直链不可达时兜底
+QQ_MIRROR="https://github.com/Rodert/qq-versions/releases/download/qq-packages-20260813-1d08f1d4"
+
+# 腾讯官方机器可读下载配置(两个等价入口，第一个不通就试第二个)
+QQ_PCCONFIG_URLS=(
+    "https://cdn-go.cn/qq-web/im.qq.com_new/latest/rainbow/pcConfig.json"
+    "https://im.qq.com/proxy/domain/cdn-go.cn/qq-web/im.qq.com_new/latest/rainbow/pcConfig.json"
+)
+
+# 解析 pcConfig.json 的内容(从 stdin 读)，输出 "<版本> <deb直链>"；解析不出返回 1。
+# 用法: qq_parse_pcconfig <amd64|arm64>
+# 拆出来单独一个函数是为了能离线自测(直接喂一段 JSON 进来，不碰网络)。
+# 只依赖 grep/sed，不需要 jq。
+qq_parse_pcconfig() {
+    local arch="$1" key="" json="" blk="" ver="" url=""
+    case "$arch" in
+        amd64) key="x64DownloadUrl" ;;
+        arm64) key="armDownloadUrl" ;;
+        *)     return 1 ;;
+    esac
+    # 压成一行，免得 JSON 里的换行缩进干扰正则
+    json="$(tr -d '\r\n')"
+    [ -n "$json" ] || return 1
+    # 先切出 Linux 段，避免命中 Windows/macOS 里的同名字段
+    blk="$(printf '%s' "$json" | sed -n 's/.*"Linux"[[:space:]]*:[[:space:]]*{//p')"
+    [ -n "$blk" ] || return 1
+    # 都取「第一个」匹配，别用贪婪 sed 取到最后一个
+    ver="$(printf '%s' "$blk" \
+        | grep -oE '"version"[[:space:]]*:[[:space:]]*"[^"]*"' \
+        | head -n1 | sed -E 's/.*"([^"]*)"$/\1/')"
+    url="$(printf '%s' "$blk" \
+        | grep -oE "\"${key}\"[[:space:]]*:[[:space:]]*\{[^}]*\}" \
+        | head -n1 \
+        | grep -oE '"deb"[[:space:]]*:[[:space:]]*"[^"]*"' \
+        | head -n1 | sed -E 's/.*"([^"]*)"$/\1/')"
+    case "$url" in
+        http*.deb)
+            [ -n "$ver" ] || return 1
+            printf '%s %s' "$ver" "$url"
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+# 查询官方配置，输出 "<版本> <deb直链>"；查不到返回 1。
+# 用法: qq_official_deb <amd64|arm64>
+qq_official_deb() {
+    local arch="$1" u="" json="" out=""
+    for u in "${QQ_PCCONFIG_URLS[@]}"; do
+        json="$(curl -fsSL --connect-timeout 10 --max-time 25 "$u" 2>/dev/null || true)"
+        [ -n "$json" ] || continue
+        out="$(printf '%s' "$json" | qq_parse_pcconfig "$arch" || true)"
+        if [ -n "$out" ]; then
+            printf '%s' "$out"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# 取版本号主干(x.y.z)，丢掉日期段/构建号后缀。
+# 例: 3.2.34_260924 -> 3.2.34 ；3.2.30-50828 -> 3.2.30 ；3.2.34 -> 3.2.34
+qq_base_version() {
+    printf '%s' "${1%%[_+-]*}"
+}
+
+# 返回指定架构的 QQ 安装包直链。
+# 用法: qq_deb_url <amd64|arm64> [版本] [下载基址]
+#   不传版本/基址时用 NapCat 那套。
+qq_deb_url() {
+    # 注意：不能写成 "${3:-$QQ_DL_BASE}" —— 那样「显式传空串」也会被替换成默认基址，
+    # 调用方传未定义的渠道变量时就拼不出空结果、反而拼出个假链接。所以按 $# 判断。
+    local arch="$1" ver="" base=""
+    case "$arch" in
+        amd64|arm64) ;;
+        *) echo ""; return 0 ;;
+    esac
+    if [ $# -ge 2 ] && [ -n "$2" ]; then ver="$2"; else ver="$QQ_PIN_VERSION"; fi
+    if [ $# -ge 3 ]; then base="$3"; else base="$QQ_DL_BASE"; fi
+    [ -n "$ver" ] || { echo ""; return 0; }
+    [ -n "$base" ] || { echo ""; return 0; }
+    # 腾讯有两种命名: linuxqq_3.2.30-50828_amd64.deb / QQ_3.2.34_260924_amd64_01.deb
+    # 带日期段的版本(含下划线)走新命名，纯 x.y.z[-build] 走老命名。
+    case "$ver" in
+        *_*) echo "${base}/QQ_${ver}_${arch}_01.deb" ;;
+        *)   echo "${base}/linuxqq_${ver}_${arch}.deb" ;;
+    esac
+}
+
+# 把 uname -m 归一化成 amd64 / arm64
+detect_arch() {
+    case "$(uname -m)" in
+        x86_64|amd64)  echo "amd64" ;;
+        aarch64|arm64) echo "arm64" ;;
+        *)             echo "" ;;
+    esac
+}
+
+# 归一化成 GitHub release 资产里的架构名 (x64 / arm64)
+detect_arch_x64() {
+    case "$(uname -m)" in
+        x86_64|amd64)  echo "x64" ;;
+        aarch64|arm64) echo "arm64" ;;
+        *)             echo "" ;;
+    esac
+}
+
 # ---------- 颜色输出 ----------
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; BLUE='\033[0;36m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 info()  { echo -e "${GREEN}[信息]${NC} $1"; }
 warn()  { echo -e "${YELLOW}[提示]${NC} $1"; }
 error() { echo -e "${RED}[错误]${NC} $1"; }
 step()  { echo -e "${BLUE}──────────────────────────────────────${NC}"; echo -e "${BOLD}${CYAN}▶ $1${NC}"; }
+
+# ---------- 高熵令牌生成 ----------
+# 字符集是精心挑过的「符号汤」：大小写字母 + 数字 + 11 个符号，共 73 个字符。
+# 刻意排除下面这些会真的把部署搞坏的字符：
+#   "  \        破坏 JSON 转义(配置文件里令牌是带引号的字符串)
+#   &  +  =  ?  破坏 URL —— OneBot 支持 ?access_token=xxx 传令牌，这几个会截断参数
+#   #  %        同上(# 会被当 fragment，% 会触发百分号解码)
+#   $  `  '     破坏 shell 引用(脚本里多处用双引号包令牌)
+#   空格 [ ] ^ |  非 URL 安全字符，且容易被复制粘贴吞掉
+# 实测这个字符集既能在配置文件/URL/shell 里安全穿行，又能提供约 6.19 bit/字符 的熵。
+TOKEN_CHARS='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!()*,;@:._~-'
+
+# 生成令牌。用法: gen_token [长度]  (默认 32 位 ≈ 198 bit)
+#
+# 为什么不用 `head -c N /dev/urandom | base64 | tr -dc ...` 那种老写法：
+# base64 的输出里只有 A-Za-z0-9+/=，用 tr 再怎么过滤也不可能凭空产出符号，
+# 结果永远是纯字母数字。这里改成「取 16 位随机整数 → 对字符集大小取模」，
+# 并带拒绝采样(丢掉 ≥ 65536 - 65536%73 的值)保证分布均匀、不引入取模偏置。
+gen_token() {
+    local len="${1:-32}"
+    case "$len" in ''|*[!0-9]*) len=32 ;; esac
+    [ "$len" -ge 1 ] || len=32
+
+    local n=${#TOKEN_CHARS}
+    local limit=$(( 65536 - (65536 % n) ))
+    local need=$(( len * 2 ))
+    local out="" v tries=0
+
+    while [ "${#out}" -lt "$len" ] && [ "$tries" -lt 10 ]; do
+        tries=$(( tries + 1 ))
+        for v in $(od -An -tu2 -N "$need" /dev/urandom 2>/dev/null); do
+            if [ "${#out}" -ge "$len" ]; then
+                break
+            fi
+            [ "$v" -lt "$limit" ] || continue
+            out="${out}${TOKEN_CHARS:$(( v % n )):1}"
+        done
+    done
+
+    # 兜底：od 或 /dev/urandom 不可用时退回纯字母数字(仍然是随机的，只是没符号)
+    if [ "${#out}" -lt "$len" ]; then
+        out="$(head -c $(( len * 3 )) /dev/urandom 2>/dev/null | base64 | tr -dc 'A-Za-z0-9' | head -c "$len")"
+    fi
+    # 最后一道保险：绝不允许返回空令牌(空令牌 = OneBot 完全没有鉴权)
+    local guard=0
+    while [ "${#out}" -lt "$len" ] && [ "$guard" -lt 10 ]; do
+        guard=$(( guard + 1 ))
+        out="${out}$(printf '%s' "$$-${RANDOM}-${RANDOM}-$(date +%N 2>/dev/null)" | tr -dc 'A-Za-z0-9')"
+    done
+
+    printf '%s' "$out" | head -c "$len"
+}
 
 # ---------- 网络请求封装: 详细日志 + 超时/重试控制 ----------
 # 用法: http_get <URL> <保存文件> <描述>
@@ -143,9 +330,9 @@ check_astrbot_installed() {
 }
 check_napcat_installed() {
     [ -f "$PWD/NapCat.AppImage" ] || [ -f "$PWD/napcat.sh" ] || [ -d "$PWD/napcat" ] \
-        || [ -d /opt/QQ ] || dpkg -l 2>/dev/null | grep -qi napcat
+        || [ -d /opt/QQ ] || [ -d "$HOME/Napcat/opt/QQ" ] \
+        || dpkg -l 2>/dev/null | grep -qi napcat
 }
-
 # ---------- 欢迎 Banner ----------
 show_banner() {
     clear
@@ -198,9 +385,10 @@ show_system_info() {
 show_intro() {
     echo -e "${BOLD}本脚本能帮你做些什么？${NC}"
     echo "  • 自动安装 AstrBot —— 智能对话机器人框架，WebUI 可视化管理，可接入各大模型"
-    echo "  • 自动安装 NapCat —— AppImage 便携版，自带 QQ+NapCat，零系统污染，扫码即用"
+    echo "  • 自动安装协议端 NapCat —— AppImage 便携版，自带 QQ+NapCat，零系统污染，扫码即用"
     echo "  • 全程无需 Docker，已针对国内网络加速 (PyPI 清华源 / GitHub 镜像)"
     echo "  • 自动检测重复部署，已安装的组件可放心跳过，不会破坏现有环境"
+    echo "  • 需要升级/维护？运行配套脚本: bash upgrade.sh"
     echo ""
 }
 
@@ -214,8 +402,10 @@ parse_args() {
             --astrbot-only) INSTALL_NAPCAT=0; shift ;;
             --napcat-only)  INSTALL_ASTRBOT=0; shift ;;
             -h|--help)
-                echo "用法: bash deploy.sh [--source] [--napcat-installer] [--astrbot-only|--napcat-only]"
+                echo "用法: bash deploy.sh [--source] [--napcat-installer]"
+                echo "                     [--astrbot-only|--napcat-only]"
                 echo "不带参数运行将进入交互引导模式。"
+                echo "升级/维护请使用: bash upgrade.sh"
                 exit 0 ;;
             *) error "未知参数: $1"; exit 1 ;;
         esac
@@ -390,39 +580,94 @@ install_astrbot() {
 # ---------- 启动 AstrBot (screen 后台) ----------
 start_astrbot() {
     export PATH="$HOME/.local/bin:$PATH"
-    if screen -ls 2>/dev/null | grep -q "astrbot"; then
+
+    # screen 里残留的 (Dead) 会话照样会被 screen -ls 列出来，但里面已经没有进程了。
+    # 不先清掉的话，后面那句「已有会话就跳过启动」会把本次启动直接吃掉 —— 表现就是
+    # 「升级完之后 AstrBot 起不来，而且日志也不再更新」。所以先 wipe 再判活。
+    screen -wipe >/dev/null 2>&1 || true
+    if screen -ls 2>/dev/null | grep -E '[0-9]+\.astrbot[[:space:]]' | grep -q 'Dead'; then
+        warn "发现残留的 Dead screen 会话 astrbot，先清理掉"
+        screen -S astrbot -X quit >/dev/null 2>&1 || true
+        sleep 1
+    fi
+    if screen -ls 2>/dev/null | grep -E '[0-9]+\.astrbot[[:space:]]' | grep -qv 'Dead'; then
         return
     fi
+
     # 显式注入 ~/.local/bin 到 PATH: screen 内 bash -c 非登录 shell 不会加载 .bashrc
     # 输出重定向到 astrbot.log: 首次启动的初始密码只会打印在启动输出里, 必须落盘才能自动提取
+    local logfile
     if [ "$USE_SOURCE" = "1" ]; then
-        screen -dmS astrbot bash -c "export PATH=\"$HOME/.local/bin:\$PATH\"; cd '$HOME/AstrBot' && uv run --no-sync main.py >> '$HOME/AstrBot/astrbot.log' 2>&1"
+        logfile="$HOME/AstrBot/astrbot.log"
+        screen -dmS astrbot bash -c "export PATH=\"$HOME/.local/bin:\$PATH\"; cd '$HOME/AstrBot' && uv run --no-sync main.py >> '$logfile' 2>&1"
     else
-        screen -dmS astrbot bash -c "export PATH=\"$HOME/.local/bin:\$PATH\"; cd '$HOME/astrbot-data' && astrbot run >> '$HOME/astrbot-data/astrbot.log' 2>&1"
+        logfile="$HOME/astrbot-data/astrbot.log"
+        screen -dmS astrbot bash -c "export PATH=\"$HOME/.local/bin:\$PATH\"; cd '$HOME/astrbot-data' && astrbot run >> '$logfile' 2>&1"
     fi
     sleep 3
-    if ! screen -ls 2>/dev/null | grep -q "astrbot"; then
-        error "AstrBot 启动失败，请手动运行: cd ~/astrbot-data && astrbot run"
+    if ! screen -ls 2>/dev/null | grep -E '[0-9]+\.astrbot[[:space:]]' | grep -qv 'Dead'; then
+        error "AstrBot 启动失败！日志尾部如下，贴出来即可定位原因："
+        if [ -f "$logfile" ]; then
+            echo "    --- $logfile ---" >&2
+            tail -n 25 "$logfile" 2>/dev/null | sed 's/^/      /' >&2
+        else
+            echo "    --- $logfile (不存在) ---" >&2
+        fi
+        # 守护服务也会拉起 AstrBot，但它的输出写在守护脚本自己的 LOG_DIR 下，
+        # 和上面这个 logfile 不是同一个文件，所以两个都要看，否则会出现「找不到日志」。
+        if [ -f /var/log/astrbot/astrbot.log ]; then
+            echo "    --- /var/log/astrbot/astrbot.log (守护服务写的) ---" >&2
+            tail -n 25 /var/log/astrbot/astrbot.log 2>/dev/null | sed 's/^/      /' >&2
+        fi
+        echo "    手动复现: cd ~/astrbot-data && astrbot run" >&2
     fi
+}
+
+# ---------- 探测 NapCat AppImage 所在目录 ----------
+# NapCat AppImage 的配置目录 = 「启动时的工作目录」/napcat/config
+# (AppImage 内 AppRun 会执行 export NAPCAT_WORKDIR=$(pwd))，
+# 所以运行目录必须稳定，否则配置与 WebUI token 会到处乱跑。
+detect_napcat_run_dir() {
+    local d
+    for d in "$PWD" "$HOME" /opt/napcat /root/napcat; do
+        [ -f "$d/NapCat.AppImage" ] && { echo "$d"; return; }
+    done
+    for d in "$PWD" "$HOME" /opt/napcat /root/napcat; do
+        if ls "$d"/QQ-*.AppImage >/dev/null 2>&1; then echo "$d"; return; fi
+    done
+    echo "$PWD"
 }
 
 # ---------- 启动 NapCat (screen 后台, 与 AstrBot 一致) ----------
 start_napcat() {
-    local run_dir="" cmd=""
-    # 仅支持 AppImage 便携版 (脚本唯一的 NapCat 安装形态)
-    if [ -f "$PWD/NapCat.AppImage" ]; then
-        run_dir="$PWD"
+    local run_dir="" img="" cmd="" qq_bin=""
+    run_dir="$(detect_napcat_run_dir)"
+    img="$(cd "$run_dir" 2>/dev/null && ls NapCat.AppImage 2>/dev/null || ls QQ-*.AppImage 2>/dev/null | head -n 1)"
+    if [ -n "$img" ]; then
         # root 下运行 Electron(QQ) 必须 --no-sandbox + 禁用沙箱环境变量
         if ldconfig -p 2>/dev/null | grep -q 'libfuse\.so\.2'; then
             # 有 FUSE: 直接挂载运行
-            cmd="xvfb-run -a bash -c 'ELECTRON_DISABLE_SANDBOX=1 ./NapCat.AppImage --no-sandbox'"
+            cmd="xvfb-run -a bash -c 'ELECTRON_DISABLE_SANDBOX=1 ./${img} --no-sandbox'"
         else
             # 无 FUSE: 用解压运行方式绕过
-            cmd="xvfb-run -a bash -c 'ELECTRON_DISABLE_SANDBOX=1 ./NapCat.AppImage --no-sandbox --appimage-extract-and-run'"
+            cmd="xvfb-run -a bash -c 'ELECTRON_DISABLE_SANDBOX=1 ./${img} --no-sandbox --appimage-extract-and-run'"
+        fi
+    else
+        # 注入式布局：NapCat 装在 QQ 里(官方脚本 rootless 或系统 /opt/QQ)
+        # 这种模式要启动的是 QQ 本体 —— NapCat 由 resources/app/package.json
+        # 里的 "main": "./loadNapCat.js" 自动注入
+        if [ -x "$HOME/Napcat/opt/QQ/qq" ]; then
+            qq_bin="$HOME/Napcat/opt/QQ/qq"
+        elif [ -x /opt/QQ/qq ]; then
+            qq_bin="/opt/QQ/qq"
+        fi
+        if [ -n "$qq_bin" ]; then
+            run_dir="$(dirname "$qq_bin")"
+            cmd="xvfb-run -a env ELECTRON_DISABLE_SANDBOX=1 '$qq_bin' --no-sandbox"
         fi
     fi
-    if [ -z "$run_dir" ]; then
-        warn "未找到 NapCat 安装文件，跳过自动启动，请手动启动。"
+    if [ -z "$img" ] && [ -z "$qq_bin" ]; then
+        warn "未找到 NapCat AppImage，也未找到已注入 NapCat 的 QQ，跳过自动启动，请手动启动。"
         return
     fi
     if screen -ls 2>/dev/null | grep -q "napcat"; then
@@ -553,10 +798,30 @@ install_napcat() {
         install_napcat_installer
     fi
 }
+# ---------- 读取系统 QQ 已安装版本 ----------
+qq_installed_version() {
+    local pkgjson="/opt/QQ/resources/app/package.json"
+    if [ -f "$pkgjson" ]; then
+        if command -v jq >/dev/null 2>&1; then
+            jq -r '.version // empty' "$pkgjson" 2>/dev/null && return 0
+        fi
+        grep -m1 '"version"' "$pkgjson" 2>/dev/null \
+            | sed -E 's/.*"version"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/'
+    fi
+}
+
+# ---------- 比较两个 QQ 版本号是否相同 ----------
+# 坑：腾讯的 deb 文件名用下划线(QQ_3.2.32_260812_amd64_01.deb)，而 QQ 自己的
+# package.json 里写的是连字符(3.2.32-260812)。直接字符串比较会永远判为「不一致」。
+qq_same_version() {
+    [ -n "$1" ] && [ -n "$2" ] || return 1
+    [ "${1//_/-}" = "${2//_/-}" ]
+}
 
 # ---------- 探测 NapCat 配置目录 ----------
 detect_napcat_config_dir() {
     local candidates=(
+        "$HOME/Napcat/opt/QQ/resources/app/app_launcher/napcat/config"
         "/opt/QQ/resources/app/app_launcher/napcat/config"
         "/opt/QQ/resources/app/napcat/config"
         "$PWD/QQ/resources/app/app_launcher/napcat/config"
@@ -571,14 +836,16 @@ detect_napcat_config_dir() {
             return
         fi
     done
-    NAPCAT_CONFIG_DIR="/opt/QQ/resources/app/app_launcher/napcat/config"
+    NAPCAT_CONFIG_DIR="$HOME/Napcat/opt/QQ/resources/app/app_launcher/napcat/config"
 }
 
 # ---------- 显示访问地址与端口放行提示 (不获取/不显示真实 IP, 以纯文本 IP 代替) ----------
 print_public_urls() {
     step "访问地址与端口放行"
     echo "  • AstrBot 管理面板: IP:6185"
-    [ "$INSTALL_NAPCAT" = "1" ] && echo "  • NapCat WebUI:      IP:6099"
+    if [ "$INSTALL_NAPCAT" = "1" ]; then
+        echo "  • NapCat WebUI:     IP:6099"
+    fi
     echo ""
     warn "已取消自动放行，若为云服务器请手动放行端口 6185、6099 (控制台/安全组)"
 }
@@ -673,7 +940,7 @@ setup_onebot11_config() {
     local conf="$NAPCAT_CONFIG_DIR/onebot11_${qq}.json"
     # 生成 16 位随机 token (反向 WS 鉴权, NapCat 与 AstrBot 两侧必须一致)
     local token
-    token=$(head -c 24 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 16)
+    token=$(gen_token)
     if [ -f "$conf" ]; then
         info "配置文件已存在: $conf，跳过创建。"
         # 从已有配置中读回 token, 方便用户填写 AstrBot 端
@@ -803,13 +1070,32 @@ get_astrbot_cmd() {
     fi
 }
 get_napcat_cmd() {
-    if [ -f "$HOME_DIR/NapCat.AppImage" ]; then
+    # 注意: NapCat AppImage 的配置目录是「启动时的工作目录」下的 napcat/config
+    # (AppRun 内部会 export NAPCAT_WORKDIR=$(pwd))，所以必须先 cd 到部署目录再启动，
+    # 否则 systemd 会以 / 为工作目录，导致配置被写到根分区根目录、WebUI token 每次都变。
+    local workdir
+    workdir="$(detect_napcat_run_dir)"
+    if [ -f "$workdir/NapCat.AppImage" ]; then
         if ldconfig -p 2>/dev/null | grep -q 'libfuse\.so\.2'; then
-            echo "cd '$HOME_DIR' && ELECTRON_DISABLE_SANDBOX=1 xvfb-run -a ./NapCat.AppImage --no-sandbox"
+            echo "cd '$workdir' && ELECTRON_DISABLE_SANDBOX=1 xvfb-run -a ./NapCat.AppImage --no-sandbox"
         else
-            echo "cd '$HOME_DIR' && ELECTRON_DISABLE_SANDBOX=1 xvfb-run -a ./NapCat.AppImage --no-sandbox --appimage-extract-and-run"
+            echo "cd '$workdir' && ELECTRON_DISABLE_SANDBOX=1 xvfb-run -a ./NapCat.AppImage --no-sandbox --appimage-extract-and-run"
         fi
+    elif [ -x "$HOME_DIR/Napcat/opt/QQ/qq" ]; then
+        echo "xvfb-run -a '$HOME_DIR/Napcat/opt/QQ/qq' --no-sandbox"
     fi
+}
+
+# NapCat AppImage 所在目录(配置目录 = 该目录/napcat/config, 必须稳定)
+detect_napcat_run_dir() {
+    local d
+    for d in /root /opt/napcat /root/napcat "$HOME_DIR"; do
+        [ -f "$d/NapCat.AppImage" ] && { echo "$d"; return; }
+    done
+    for d in /root /opt/napcat /root/napcat "$HOME_DIR"; do
+        if ls "$d"/QQ-*.AppImage >/dev/null 2>&1; then echo "$d"; return; fi
+    done
+    echo "$HOME_DIR"
 }
 
 rotate_log() {
@@ -847,23 +1133,33 @@ check_and_restart() {
 restart_all() {
     log "定时重启: AstrBot + NapCat (每周一 10:00)"
     pkill -f "astrbot run|uv run --no-sync main.py" 2>/dev/null || true
-    pkill -f "NapCat.AppImage|qq --no-sandbox" 2>/dev/null || true
+    pkill -f "$PROTO_PATTERN" 2>/dev/null || true
     screen -S astrbot -X quit 2>/dev/null || true
     screen -S napcat -X quit 2>/dev/null || true
     sleep 3
     start_window "astrbot" "$ASTRBOT_CMD"
-    start_window "napcat" "$NAPCAT_CMD"
+    start_window "napcat" "$PROTO_CMD"
     log "定时重启完成"
 }
 
 main() {
     mkdir -p "$LOG_DIR"
     ASTRBOT_CMD=$(get_astrbot_cmd)
-    NAPCAT_CMD=$(get_napcat_cmd)
+    PROTO_CMD=$(get_napcat_cmd)
+    PROTO_PATTERN='NapCat\.AppImage|QQ-.*\.AppImage|Napcat/opt/QQ/qq'
     log "=========================================="
-    log "守护脚本启动 (崩溃自愈 + 每周一 10:00 定时重启)"
-    [ -n "$ASTRBOT_CMD" ] && start_window "astrbot" "$ASTRBOT_CMD" || log "未检测到 AstrBot 安装"
-    [ -n "$NAPCAT_CMD" ] && start_window "napcat" "$NAPCAT_CMD" || log "未检测到 NapCat 安装"
+    log "守护脚本启动 (崩溃自愈 + 每周一 10:00 定时重启) 协议端: NapCat"
+    # 注意: 本脚本 set -e，不能用 [ -n x ] && cmd || log 的短路写法（判定失败会直接退出）
+    if [ -n "$ASTRBOT_CMD" ]; then
+        start_window "astrbot" "$ASTRBOT_CMD"
+    else
+        log "未检测到 AstrBot 安装"
+    fi
+    if [ -n "$PROTO_CMD" ]; then
+        start_window "napcat" "$PROTO_CMD"
+    else
+        log "未检测到 NapCat 安装"
+    fi
     while true; do
         # 每周一 10:00-10:30 定时重启 (北京时间)
         if [ "$(TZ=Asia/Shanghai date +%u)" = "$RESTART_WEEKDAY" ] && [ "$(TZ=Asia/Shanghai date +%H)" = "$RESTART_HOUR" ] && [ "$(TZ=Asia/Shanghai date +%M)" -lt 30 ]; then
@@ -873,8 +1169,12 @@ main() {
                 echo "$week" > /tmp/.last_restart_week
             fi
         fi
-        [ -n "$ASTRBOT_CMD" ] && check_and_restart "astrbot" "astrbot run|uv run --no-sync main.py" "$ASTRBOT_CMD"
-        [ -n "$NAPCAT_CMD" ] && check_and_restart "napcat" "NapCat.AppImage|qq --no-sandbox" "$NAPCAT_CMD"
+        if [ -n "$ASTRBOT_CMD" ]; then
+            check_and_restart "astrbot" "astrbot run|uv run --no-sync main.py" "$ASTRBOT_CMD"
+        fi
+        if [ -n "$PROTO_CMD" ]; then
+            check_and_restart "napcat" "$PROTO_PATTERN" "$PROTO_CMD"
+        fi
         sleep "$CHECK_INTERVAL"
     done
 }
@@ -921,8 +1221,8 @@ echo -e "${BLUE}内存与 Swap:${NC}"
 free -h
 echo ""
 echo -e "${BLUE}服务状态:${NC}"
-pgrep -af "astrbot run|uv run --no-sync main.py" >/dev/null && echo -e "  ${GREEN}[运行中]${NC} AstrBot" || echo -e "  ${RED}[已停止]${NC} AstrBot"
-pgrep -af "NapCat.AppImage|qq --no-sandbox" >/dev/null && echo -e "  ${GREEN}[运行中]${NC} NapCat" || echo -e "  ${RED}[已停止]${NC} NapCat"
+pgrep -f "astrbot run|uv run --no-sync main.py" >/dev/null && echo -e "  ${GREEN}[运行中]${NC} AstrBot" || echo -e "  ${RED}[已停止]${NC} AstrBot"
+pgrep -f "NapCat\.AppImage|QQ-.*\.AppImage|qq --no-sandbox" >/dev/null && echo -e "  ${GREEN}[运行中]${NC} NapCat" || echo -e "  ${RED}[已停止]${NC} NapCat"
 echo ""
 echo -e "${BLUE}Screen 会话:${NC}"
 screen -list | sed 's/^/  /'
@@ -937,13 +1237,14 @@ echo -e "${BLUE}常用命令:${NC}"
 echo "  botlog     -> 实时查看日志"
 echo "  botscreen  -> 进入 screen 会话"
 echo "  botrestart -> 重启守护服务"
+echo "  upgrade    -> 升级/维护 (bash upgrade.sh)"
 PANEL
     chmod +x /root/bot-status.sh
 
     # 6. 命令别名
     grep -q "alias bot=" /root/.bashrc 2>/dev/null || cat >> /root/.bashrc <<'ALIAS'
 
-# AstrBot/NapCat 管理命令
+# AstrBot 管理命令
 alias bot='/root/bot-status.sh'
 alias botlog='tail -f /var/log/astrbot/guardian.log'
 alias botscreen='screen -r astrbot || screen -r napcat'
@@ -996,6 +1297,7 @@ main() {
     if [ "$INSTALL_NAPCAT" = "1" ]; then
         if check_napcat_installed && confirm_skip_or_reinstall "NapCat"; then
             warn "已跳过 NapCat 安装（检测到已部署）。"
+            INSTALL_NAPCAT=0
         else
             DO_NAPCAT=1
         fi
@@ -1018,25 +1320,34 @@ main() {
     fi
 
     if [ "$DO_NAPCAT" = "1" ]; then
-        install_napcat
-        start_napcat
+        if install_napcat; then
+            start_napcat
+        else
+            warn "NapCat 安装未完成，已跳过对应的启动与配置步骤。"
+            INSTALL_NAPCAT=0
+        fi
     fi
 
-    # ---------- 收尾: 访问地址 / 登录信息 / NapCat 配置 ----------
-    if [ "$INSTALL_ASTRBOT" = "1" ] || [ "$INSTALL_NAPCAT" = "1" ]; then
+    # ---------- 收尾: 访问地址 / 登录信息 / 协议端配置 ----------
+    print_public_urls
+    if [ "$INSTALL_ASTRBOT" = "1" ]; then
+        print_astrbot_login
+    fi
+    if [ "$INSTALL_NAPCAT" = "1" ]; then
         detect_napcat_config_dir
-        print_public_urls
-        if [ "$INSTALL_ASTRBOT" = "1" ]; then
-            print_astrbot_login
-        fi
-        if [ "$INSTALL_NAPCAT" = "1" ]; then
-            print_napcat_token
-            setup_onebot11_config
-        fi
+        print_napcat_token
+        setup_onebot11_config
     fi
 
     # 部署守护体系 (崩溃自愈 / 每周一 10:00 重启 / systemd 自启 / 状态面板)
-    setup_guardian
+    if [ "$INSTALL_ASTRBOT" = "1" ] || [ "$INSTALL_NAPCAT" = "1" ]; then
+        setup_guardian
+    fi
 }
 
-main "$@"
+# ---------- 入口 ----------
+# 函数库模式: upgrade.sh 会以 ASTRBOT_DEPLOY_LIB=1 的方式 source 本文件，
+# 复用这里的下载/安装/探测/启动实现，避免同一套逻辑维护两份而逐渐走偏。
+if [ "${ASTRBOT_DEPLOY_LIB:-0}" != "1" ]; then
+    main "$@"
+fi
